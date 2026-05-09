@@ -122,6 +122,7 @@ def scrape_job(link: str, job_id: str) -> Row:
 def start_scraping() -> DataFrame:
     trades = ["data", "ai", "agentic", "software"]
     rows   = []
+    seen_ids: set = set()  # persist across ALL trades to prevent cross-keyword duplicates
 
     for trade in trades:
         total_jobs   = 0
@@ -147,6 +148,9 @@ def start_scraping() -> DataFrame:
                 if not match:
                     continue
                 job_id   = match.group(1)
+                if job_id in seen_ids:
+                    continue
+                seen_ids.add(job_id)
                 full_url = f"{individual_job_url}{href}"
                 try:
                     rows.append(scrape_job(full_url, job_id))

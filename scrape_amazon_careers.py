@@ -126,8 +126,8 @@ def fetch_job_description(job_path: str, retries: int = 3,
 
 def scrape_all_jobs() -> DataFrame:
     all_jobs: list = []
+    seen_ids: set = set()  # persist across ALL trends to prevent cross-keyword duplicates
     for trend in TRENDS:
-        seen_ids: set = set()
         for offset in OFFSETS:
             jobs = fetch_jobs(trend, offset)
             if not jobs:
