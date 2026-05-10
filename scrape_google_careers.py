@@ -1,4 +1,3 @@
-# Databricks notebook source
 # ══════════════════════════════════════════════════════════════════════════════
 # 01_scrape_google_careers.py
 #
@@ -9,9 +8,6 @@
 #
 # Does NOT advance last_processed_dt — that belongs to 03_data_cleaning.
 # ══════════════════════════════════════════════════════════════════════════════
-
-# COMMAND ----------
-
 import os
 from pipeline_watermark import WatermarkManager
 from pyspark.sql.types import StructType, StructField, StringType, TimestampType, DateType
@@ -31,9 +27,6 @@ individual_job_url="https://www.google.com/about/careers/applications/"
 # ─────────────────────────────────────────────────────────────
 # WATERMARK — register + skip-guard
 # ─────────────────────────────────────────────────────────────
-
-# COMMAND ----------
-
 def check_if_rerun(wm_obj,org_id)-> bool:
     try:
         already_scraped = (
@@ -64,8 +57,6 @@ def check_if_rerun(wm_obj,org_id)-> bool:
 # ─────────────────────────────────────────────────────────────
 # SCRAPING HELPERS
 # ─────────────────────────────────────────────────────────────
-
-# COMMAND ----------
 
 def get_job_title(soup):
     try:    return soup.find("h2", {"class": "p1N2lc"}).get_text(strip=True)
@@ -121,8 +112,6 @@ def scrape_job(link: str, job_id: str) -> Row:
 # ─────────────────────────────────────────────────────────────
 # SCRAPE
 # ─────────────────────────────────────────────────────────────
-
-# COMMAND ----------
 
 def start_scraping() -> DataFrame:
     trades = ["data", "ai", "agentic", "software"]

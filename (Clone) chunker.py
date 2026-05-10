@@ -298,6 +298,7 @@ def sentence_window_chunk_udf(
 # ─────────────────────────────────────────────────────────────
 
 # COMMAND ----------
+
 def _apply_sentence_window_strategy(df_to_chunk):
     """Original sentence-window chunking. One row per sentence, with
     ±WINDOW_SIZE display context. Kept for backwards compatibility and

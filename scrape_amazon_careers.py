@@ -1,4 +1,4 @@
-# Databricks notebook source
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 02_scrape_amazon_careers.py
 #
@@ -9,9 +9,6 @@
 #
 # Does NOT advance last_processed_dt — that belongs to 03_data_cleaning.
 # ══════════════════════════════════════════════════════════════════════════════
-
-# COMMAND ----------
-
 import os
 from pipeline_watermark import WatermarkManager
 from pyspark.sql import DataFrame, functions as F, Window
@@ -44,9 +41,6 @@ FIELDS = {"id_icims", "job_category", "job_family", "job_path", "location", "pos
 # ─────────────────────────────────────────────────────────────
 # SCRAPING HELPERS
 # ─────────────────────────────────────────────────────────────
-
-# COMMAND ----------
-
 def parse_job(job: dict) -> dict:
     parsed = {k: job.get(k) for k in FIELDS}
     try:
