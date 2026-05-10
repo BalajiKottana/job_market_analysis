@@ -109,6 +109,12 @@ def build_filters(filters: dict) -> dict:
     if filters.get("exclude_interns", True):
         vs["is_intern"] = False   # Python bool → JSON false — NOT the string "false"
 
+    # granularity: "document" | "section" | "paragraph" | "sentence"
+    # Default behaviour: leave unfiltered so multi-granularity recall works.
+    # Callers that need a specific level pass filters["granularity"] explicitly.
+    if filters.get("granularity"):
+        vs["granularity"] = filters["granularity"]
+
     return vs
 
 
@@ -141,6 +147,10 @@ def post_filter(chunks: list, filters: dict) -> list:
 COLUMNS = [
     "chunk_id", "sentence", "window_text",
     "doc_id",
+    # multi-granularity fields — present after the chunker is re-run
+    # against CHUNKING_STRATEGY="multi_granularity". Safe to include even
+    # when the index doesn't have them yet (VS just drops unknown names).
+    "granularity", "parent_chunk_id", "token_count_est",
     "org_key", "title_clean", "job_family", "domain", "team_name",
     "job_location_clean", "country",
     "seniority", "seniority_source",

@@ -35,10 +35,28 @@ QUARANTINE_TABLE = f"{catalog}.{schema_name}.quarantine_openings"
 QUARANTINE_SCRAPE_URLS = f"{catalog}.{schema_name}.scraped_error_logs"
 
 CHUNKS_TABLE = f"{catalog}.{schema_name}.job_sentence_chunks"
+LINKEDIN_DRAFTS_TABLE = f"{catalog}.{schema_name}.linkedin_drafts"
 
-#chunking parameters
+# ── chunking strategy ────────────────────────────────────────────
+# "sentence_window"   = original behaviour (sentence + ±W context)
+# "multi_granularity" = four levels (document / section / paragraph / sentence)
+#                       linked by parent_chunk_id. Recommended for broad
+#                       downstream use (recommendation, comparison, Q&A,
+#                       trends, career-path mapping, etc.).
+CHUNKING_STRATEGY = "multi_granularity"
+
+# sentence-window parameters (used by both strategies for the sentence layer)
 WINDOW_SIZE      = 2    # sentences each side of focal sentence
 MIN_SENTENCE_LEN = 20   # discard fragments shorter than this
+
+# multi-granularity parameters
+TARGET_PARAGRAPH_TOKENS   = 350   # paragraph chunk size target
+PARAGRAPH_OVERLAP_TOKENS  = 50    # overlap between adjacent paragraphs
+APPROX_CHARS_PER_TOKEN    = 4     # rough English-text estimate
+
+SUMMARY_LLM_ENDPOINT       = "databricks-meta-llama-3-3-70b-instruct"
+SECTION_SUMMARY_MAX_TOKENS = 200
+DOC_SUMMARY_MAX_TOKENS     = 300
 
 #vector search parameters
 VS_INDEX     = f"{catalog}.{schema_name}.job_chunks_index"  

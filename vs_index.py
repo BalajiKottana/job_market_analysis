@@ -93,6 +93,8 @@ def create_or_use_vector_index(w: WorkspaceClient, wm: WatermarkManager) -> bool
                     "columns_to_sync": [
                         "chunk_id", "doc_id", "sentence", "window_text",
                         "section", "section_type", "sentence_index",
+                        # multi-granularity additions
+                        "granularity", "parent_chunk_id", "token_count_est",
                         "org_key", "job_id", "title_clean", "job_family",
                         "domain", "team_name", "seniority", "seniority_source",
                         "is_intern", "job_location_clean", "country",

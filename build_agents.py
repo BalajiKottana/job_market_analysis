@@ -525,9 +525,38 @@ def linkedin_node(state: AgentState, config: RunnableConfig) -> dict:
         ))],
         config=config,
     )
+
+    # Write the draft to the approval queue. We do this inside the node (rather
+    # than in run_query) so any caller — interactive notebook, scheduled job,
+    # MCP-triggered run — gets the same audit trail without remembering to
+    # persist. Failures here must not break the agent; we swallow and warn.
+    draft_id = None
+    try:
+        from linkedin_drafts import save_draft  # lazy: not all envs have spark
+        try:
+            spark  # type: ignore  # Databricks-injected global
+        except NameError:
+            from pyspark.sql import SparkSession
+            _spark = SparkSession.builder.getOrCreate()
+        else:
+            _spark = spark  # type: ignore
+
+        draft_id = save_draft(
+            spark        = _spark,
+            source_query = state.get("query", ""),
+            intent       = state.get("intent", "general"),
+            analysis_md  = state.get("final_answer", "") or "",
+            post_text    = resp.content,
+        )
+        print(f"[linkedin_node] draft saved: {draft_id}")
+    except Exception as e:
+        # Never let queueing failures prevent the post text from being returned.
+        print(f"[linkedin_node] draft save skipped: {e}")
+
     return {
-        "messages":     [AIMessage(content=resp.content, name="linkedin")],
+        "messages":      [AIMessage(content=resp.content, name="linkedin")],
         "linkedin_post": resp.content,
+        "draft_id":      draft_id,
     }
 
 

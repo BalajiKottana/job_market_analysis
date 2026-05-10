@@ -14,7 +14,7 @@
 
 import os
 from pipeline_watermark import WatermarkManager
-from pyspark.sql import DataFrame, functions as F
+from pyspark.sql import DataFrame, functions as F, Window
 from datetime import datetime, date
 from bs4 import BeautifulSoup
 import re, requests, time, uuid
@@ -126,7 +126,13 @@ def fetch_job_description(job_path: str, retries: int = 3,
 
 def scrape_all_jobs() -> DataFrame:
     all_jobs: list = []
-    seen_ids: set = set()  # persist across ALL trends to prevent cross-keyword duplicates
+    # Hoisted out of the trend loop. Previously this set was reset every
+    # trend, so a job that surfaced under both "data engineer" and "ai"
+    # (very common for ML/data roles) was scraped — and HTTP-fetched —
+    # twice, then both copies flowed into the MERGE. Hoisting makes the
+    # in-memory dedup global for this run; the Spark dedup below is the
+    # second line of defence at the boundary into Delta.
+    seen_ids: set = set()
     for trend in TRENDS:
         for offset in OFFSETS:
             jobs = fetch_jobs(trend, offset)
@@ -180,30 +186,76 @@ def check_if_rerun(wm_obj, org_id) -> bool:
             .limit(1)
             .count()
         ) > 0
-        
+
         if already_scraped:
             wm_obj.mark_skipped(org_id, f"file_dt={today} already present in raw_openings")
-             
-    except:
-        print(f"Error checking for already scraped data")
+
+    except Exception as e:
+        # See note in the Google scraper: bare except hid Unity Catalog
+        # errors and let the scraper proceed unchecked.
+        print(f"[amazon] check_if_rerun error: {type(e).__name__}: {e}")
         already_scraped = False
     return already_scraped
 
 
+def _dedupe_for_merge(df: DataFrame) -> DataFrame:
+    """
+    Collapse source-side duplicates before MERGE.
+
+    For Amazon the canonical key is (id_icims, lower(organization)). NULL
+    id_icims rows are dropped entirely — see the long note in merge_result.
+    Within a key group we prefer the freshest, richest record.
+    """
+    w = (Window
+         .partitionBy(F.col("id_icims"),
+                      F.lower(F.col("organization")))
+         .orderBy(F.col("ingested_at").desc(),
+                  F.length(F.col("job_description")).desc()))
+    return (
+        df
+        # NULL id_icims rows always fall into "not matched" (NULL = NULL is
+        # NULL in SQL), so each run inserts another copy. Drop them entirely;
+        # downstream cleaning has nothing to anchor to without a job id.
+        .filter(F.col("id_icims").isNotNull() &
+                (F.col("id_icims") != ""))
+        .withColumn("_rn", F.row_number().over(w))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+    )
+
+
 def merge_result(rowsDf: DataFrame) -> bool:
     try:
+        before = rowsDf.count()
+        rowsDf = _dedupe_for_merge(rowsDf)
+        after  = rowsDf.count()
+        if before != after:
+            print(f"[amazon] dedup collapsed {before} → {after} source rows "
+                  f"(includes any NULL id_icims drops)")
+
         rowsDf.createOrReplaceTempView("amazon_source")
+
+        # MERGE upgrades:
+        #   - lower(organization) on both sides — defensive, ORGANIZATION
+        #     is hardcoded "amazon" today but a future scraper change could
+        #     break the join silently.
+        #   - WHEN MATCHED THEN UPDATE ingested_at — heartbeat AND it
+        #     activates Delta's cardinality safety net so any future
+        #     dedup gap fails loud instead of double-inserting.
         spark.sql(f"""
         MERGE INTO {RAW_TABLE} AS T
         USING amazon_source AS S
-        ON  T.job_id       = S.id_icims
-        AND T.organization = S.organization
+        ON  T.job_id              = S.id_icims
+        AND lower(T.organization) = lower(S.organization)
+        WHEN MATCHED THEN UPDATE SET
+            ingested_at = S.ingested_at
         WHEN NOT MATCHED THEN INSERT (
             doc_id, source_type, source_url, organization, job_id,
             title, job_location, job_description,
             ingested_at, file_dt, notional_job_posted_dt,scrape_org_key
         ) VALUES (
-            S.doc_id, S.source_type, S.job_url, S.organization, S.id_icims,
+            S.doc_id, S.source_type, S.job_url,
+            lower(S.organization), S.id_icims,
             S.job_title, S.location, S.job_description,
             S.ingested_at, S.file_dt, S.posted_date,S.scrape_org_key
         )
@@ -211,7 +263,7 @@ def merge_result(rowsDf: DataFrame) -> bool:
         print(f"Amazon MERGE complete → {RAW_TABLE}")
         return True
     except Exception as e:
-        print(f"MERGE failed: {e}")
+        print(f"[amazon] MERGE failed: {type(e).__name__}: {e}")
         return False
 
 

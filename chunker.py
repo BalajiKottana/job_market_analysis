@@ -18,7 +18,11 @@
 # COMMAND ----------
 
 from pipeline_watermark import WatermarkManager
-from properties import CLEAN_TABLE, CHUNKS_TABLE, WINDOW_SIZE, MIN_SENTENCE_LEN
+from properties import (
+    CLEAN_TABLE, CHUNKS_TABLE,
+    WINDOW_SIZE, MIN_SENTENCE_LEN,
+    CHUNKING_STRATEGY,
+)
 
 import os
 import re
@@ -294,6 +298,44 @@ def sentence_window_chunk_udf(
 # ─────────────────────────────────────────────────────────────
 
 # COMMAND ----------
+def _apply_sentence_window_strategy(df_to_chunk):
+    """Original sentence-window chunking. One row per sentence, with
+    ±WINDOW_SIZE display context. Kept for backwards compatibility and
+    A/B comparison with the multi-granularity strategy."""
+    return (
+        df_to_chunk
+        .withColumn("chunks", sentence_window_chunk_udf(
+            F.col("doc_id"),
+            F.col("job_description"),
+            F.col("org_key"),
+        ))
+        .withColumn("chunk", F.explode("chunks"))
+        .select(
+            F.col("chunk.chunk_id").alias("chunk_id"),
+            F.lit("sentence").alias("granularity"),
+            F.lit(None).cast("string").alias("parent_chunk_id"),
+            F.col("chunk.sentence").alias("sentence"),
+            F.col("chunk.window_text").alias("window_text"),
+            F.col("chunk.section").alias("section"),
+            F.col("chunk.section_type").alias("section_type"),
+            F.col("chunk.sentence_index").alias("sentence_index"),
+            (F.length(F.col("chunk.sentence")) / 4).cast("int").alias("token_count_est"),
+            "doc_id","source_type","source_url",
+            "org_key","job_id",
+            "title_clean","job_family","domain",
+            "team_name","seniority","seniority_source",
+            "is_intern","job_location_clean","country",
+            "file_dt","notional_job_posted_dt",
+        )
+        .withColumn("trend_dt",
+            F.coalesce(
+                F.to_date(F.col("notional_job_posted_dt")),
+                F.to_date(F.col("file_dt"))
+            )
+        )
+    )
+
+
 def apply_chnunking(wm: WatermarkManager, normalize_floor: str, chunk_wm: str)->bool:
     try:
         df_to_chunk = (
@@ -305,43 +347,23 @@ def apply_chnunking(wm: WatermarkManager, normalize_floor: str, chunk_wm: str)->
 
         chunk_input_count = df_to_chunk.count()
         print(f"Documents to chunk: {chunk_input_count}")
+        print(f"Chunking strategy: {CHUNKING_STRATEGY}")
 
         if chunk_input_count == 0:
             wm.mark_stage_success("chunk", normalize_floor, 0)
             print("No data to chunk, exiting.")
             return True
 
-        df_chunked = (
-            df_to_chunk
-            .withColumn("chunks", sentence_window_chunk_udf(
-                F.col("doc_id"),
-                F.col("job_description"),
-                F.col("org_key"),
-            ))
-            .withColumn("chunk", F.explode("chunks"))
-            .select(
-                F.col("chunk.chunk_id").alias("chunk_id"),
-                F.col("chunk.sentence").alias("sentence"),
-                F.col("chunk.window_text").alias("window_text"),
-                F.col("chunk.section").alias("section"),
-                F.col("chunk.section_type").alias("section_type"),
-                F.col("chunk.sentence_index").alias("sentence_index"),
-                "doc_id","source_type","source_url",
-                "org_key","job_id",
-                "title_clean","job_family","domain",
-                "team_name","seniority","seniority_source",
-                "is_intern","job_location_clean","country",
-                "file_dt","notional_job_posted_dt",
-            )
-            .withColumn("trend_dt",
-                F.coalesce(
-                    F.to_date(F.col("notional_job_posted_dt")),
-                    F.to_date(F.col("file_dt"))
-                )
-            )
-        )
+        # ── Strategy dispatch ──────────────────────────────────────
+        if CHUNKING_STRATEGY == "multi_granularity":
+            # Lazy import keeps the sentence_window-only path free of any
+            # transitive dependency on chunking_strategies.py.
+            from chunking_strategies import build_multi_granularity_chunks
+            df_chunked = build_multi_granularity_chunks(spark, df_to_chunk)
+        else:
+            df_chunked = _apply_sentence_window_strategy(df_to_chunk)
 
-        # MERGE on (doc_id, chunk_id) — idempotent
+        # MERGE on (doc_id, chunk_id) — idempotent across re-runs
         df_chunked.createOrReplaceTempView("chunks_source")
         spark.sql(f"""
             MERGE INTO {CHUNKS_TABLE} AS T
@@ -354,12 +376,20 @@ def apply_chnunking(wm: WatermarkManager, normalize_floor: str, chunk_wm: str)->
         total_chunks = df_chunked.count()
         print(f"Chunks written: {total_chunks}")
 
+        # Per-granularity counts make it obvious if the LLM-summary stage
+        # silently produced zero rows (e.g. ai_query throttling).
+        try:
+            df_chunked.groupBy("granularity").count() \
+                      .orderBy("granularity").show(truncate=False)
+        except Exception:
+            pass
+
         wm.mark_stage_success("chunk", normalize_floor, total_chunks)
 
     except Exception as e:
         wm.mark_stage_failed("chunk", str(e))
         return False
-    return True        
+    return True
 
 
 
@@ -375,6 +405,10 @@ def apply_chnunking(wm: WatermarkManager, normalize_floor: str, chunk_wm: str)->
 
 def main()->None:
     wm=WatermarkManager(spark)
+    # Multi-granularity introduces new columns (granularity, parent_chunk_id,
+    # token_count_est). Allow Delta MERGE to add them on first run rather
+    # than forcing a manual ALTER TABLE.
+    spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
     wm.register_org("_pipeline", stage="chunk", seed_dt="2024-01-01")
     normalize_floor = wm.get_pipeline_watermark()
     chunk_wm        = wm.get_stage_watermark("chunk")

@@ -15,7 +15,7 @@
 import os
 from pipeline_watermark import WatermarkManager
 from pyspark.sql.types import StructType, StructField, StringType, TimestampType, DateType
-from pyspark.sql import Row, DataFrame, functions as F
+from pyspark.sql import Row, DataFrame, functions as F, Window
 import requests, uuid, re
 from datetime import datetime, timezone, date
 from bs4 import BeautifulSoup
@@ -45,13 +45,18 @@ def check_if_rerun(wm_obj,org_id)-> bool:
             .limit(1)
             .count()
         ) > 0
-        
+
         if already_scraped:
             wm_obj.mark_skipped(org_id, f"file_dt={today} already present in raw_openings")
-            
-             
-    except:
-        print("Error checking for already scraped data")
+
+    except Exception as e:
+        # Bare except silently swallowed Unity Catalog hiccups and let the
+        # scraper proceed as if no data existed — that's how a partial earlier
+        # run could end up with a second copy of every row. Log and treat the
+        # check as inconclusive (safer to skip than to risk duplicates, but
+        # keeping the original behaviour of attempting the scrape since the
+        # MERGE itself is now duplicate-safe).
+        print(f"[google] check_if_rerun error: {type(e).__name__}: {e}")
         already_scraped = False
     return already_scraped
 
@@ -165,29 +170,79 @@ def start_scraping() -> DataFrame:
     return spark.createDataFrame(rows, schema=DOCUMENT_SCHEMA)
     
 
+def _dedupe_for_merge(df: DataFrame) -> DataFrame:
+    """
+    Collapse source-side duplicates before MERGE.
+
+    Why this is necessary: Delta MERGE evaluates each source row against the
+    target snapshot taken at the start of the operation. With WHEN NOT MATCHED
+    only, two source rows that share (job_id, organization) but find no target
+    match BOTH get classified as "not matched" and BOTH get inserted. The
+    Google scraper sweeps four trade keywords across ten pages each, so any
+    job that matches multiple keywords arrives in the source N times.
+
+    Dedup rule:
+      partition by (job_id, lower(organization))     -- canonical key
+      order by ingested_at DESC, length(description) -- prefer the freshest,
+                                                       richest record
+      keep the top row.
+
+    Also drops rows with NULL job_id (the Google JOB_ID_PATTERN regex already
+    skips these, but the filter is cheap insurance for future scraper changes).
+    """
+    w = (Window
+         .partitionBy(F.col("job_id"),
+                      F.lower(F.col("organization")))
+         .orderBy(F.col("ingested_at").desc(),
+                  F.length(F.col("job_description")).desc()))
+    return (
+        df
+        .filter(F.col("job_id").isNotNull() & (F.col("job_id") != ""))
+        .withColumn("_rn", F.row_number().over(w))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+    )
+
+
 def merge_result(rowsDf: DataFrame) -> bool:
     try:
+        # 1. Source-side dedup. Without this the MERGE inserts duplicates.
+        before = rowsDf.count()
+        rowsDf = _dedupe_for_merge(rowsDf)
+        after  = rowsDf.count()
+        if before != after:
+            print(f"[google] dedup collapsed {before} → {after} source rows")
+
         rowsDf.createOrReplaceTempView("google_source")
+
+        # 2. MERGE on lower(organization) so case differences in the parsed
+        #    org name (Google / google / YouTube vs youtube) don't create
+        #    parallel keys. The WHEN MATCHED THEN UPDATE clause turns this
+        #    into a true upsert and engages Delta's cardinality safety net:
+        #    if dedup ever fails to collapse all source duplicates, the
+        #    MERGE will now error loudly instead of silently double-inserting.
         spark.sql(f"""
             MERGE INTO {RAW_TABLE} AS T
             USING google_source AS S
-            ON  T.job_id       = S.job_id
-            AND T.organization = S.organization
+            ON  T.job_id              = S.job_id
+            AND lower(T.organization) = lower(S.organization)
+            WHEN MATCHED THEN UPDATE SET
+                ingested_at = S.ingested_at
             WHEN NOT MATCHED THEN INSERT (
                 doc_id, source_type, source_url, organization, job_id,
                 title, job_location, job_position, job_description,
                 ingested_at, file_dt, notional_job_posted_dt, scrape_org_key
             ) VALUES (
-                S.doc_id, S.source_type, S.source_url, S.organization, S.job_id,
+                S.doc_id, S.source_type, S.source_url,
+                lower(S.organization), S.job_id,
                 S.title, S.job_location, S.job_position, S.job_description,
                 S.ingested_at, S.file_dt, S.file_dt, S.scrape_org_key
             )
         """)
-        # logger.info("Google MERGE complete -> %s", RAW_TABLE)
         print(f"Google MERGE complete -> {RAW_TABLE}")
         return True
     except Exception as e:
-        #logger.error("MERGE failed: %s", e)
+        print(f"[google] MERGE failed: {type(e).__name__}: {e}")
         return False
 
 

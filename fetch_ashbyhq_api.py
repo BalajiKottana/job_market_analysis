@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, date,timezone
 from bs4 import BeautifulSoup
 from properties import  RAW_TABLE,COMPANIES,ingestion_stage,QUARANTINE_SCRAPE_URLS
-from pyspark.sql import Row, DataFrame, functions as F
+from pyspark.sql import Row, DataFrame, functions as F, Window
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -142,32 +142,64 @@ def fetch_ashbyhq_jobs(wm) -> list[dict]:
     return spark.createDataFrame(results)   
 
 
+def _dedupe_for_merge(df: DataFrame) -> DataFrame:
+    """
+    Collapse source-side duplicates before MERGE.
+
+    Ashby returns one job once per company, so within-company duplicates are
+    rare — but a company that appears under multiple ATS slugs in COMPANIES,
+    or future re-runs that re-emit the same job in the same batch, would
+    duplicate. Dropping NULL job_ids is also defensive: Ashby's API can
+    omit `id` for unlisted/draft postings.
+    """
+    w = (Window
+         .partitionBy(F.col("job_id"),
+                      F.lower(F.col("organization")))
+         .orderBy(F.col("ingested_at").desc(),
+                  F.length(F.col("job_description")).desc()))
+    return (
+        df
+        .filter(F.col("job_id").isNotNull() & (F.col("job_id") != ""))
+        .withColumn("_rn", F.row_number().over(w))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+    )
+
+
 def merge_result(rowsDf: DataFrame ,wm) -> bool:
     try:
+        before = rowsDf.count()
+        rowsDf = _dedupe_for_merge(rowsDf)
+        after  = rowsDf.count()
+        if before != after:
+            print(f"[ashby] dedup collapsed {before} → {after} source rows")
+
         rowsDf.createOrReplaceTempView("ashbyhq_source")
         spark.sql(f"""
             MERGE INTO {RAW_TABLE} AS T
             USING ashbyhq_source AS S
-            ON  T.job_id       = S.job_id
-            AND T.organization = S.organization
+            ON  T.job_id              = S.job_id
+            AND lower(T.organization) = lower(S.organization)
+            WHEN MATCHED THEN UPDATE SET
+                ingested_at = S.ingested_at
             WHEN NOT MATCHED THEN INSERT (
                 doc_id, source_type, source_url, organization, job_id,
                 title, job_location, job_description,
                 ingested_at, file_dt, notional_job_posted_dt, scrape_org_key,
                 employment_type, workspace_type,team_name
             ) VALUES (
-                S.doc_id, S.source_type, S.job_url, S.organization, S.job_id,
+                S.doc_id, S.source_type, S.job_url,
+                lower(S.organization), S.job_id,
                 S.job_title, S.location,  S.job_description,
-                S.ingested_at, S.file_dt, S.posted_date, S.organization,
+                S.ingested_at, S.file_dt, S.posted_date,
+                lower(S.organization),
                 S.employment_type, S.workplace_type, S.team
             )
         """)
-        # logger.info("Google MERGE complete -> %s", RAW_TABLE)
-        print(f"Google MERGE complete -> {RAW_TABLE}")
+        print(f"AshbyHq MERGE complete -> {RAW_TABLE}")
         return True
     except Exception as e:
-        #logger.error("MERGE failed: %s", e)
-        print(f"MERGE failed: {e}")
+        print(f"[ashby] MERGE failed: {type(e).__name__}: {e}")
         return False
 
 
